@@ -1,12 +1,10 @@
 """
 model.py — Lightweight Restormer (MDTA + GDFN) for single-channel restoration.
 
-Restormer itself operates at fixed resolution (it's a denoising/deblurring
-transformer, not an SR network). Since this task needs LR -> HR upscaling,
-we bicubic-upsample the LR input to HR resolution first, run the Restormer
-U-Net as a *refinement/residual* network on top of that baseline, and add
-a global skip connection. This keeps the transformer body architecturally
-faithful to the paper while still solving the resolution-loss degradation.
+This architecture fuses multi-scale Restormer features with explicit edge
+attention and a lightweight frequency-domain branch. A learnable sub-pixel
+upsampler replaces fixed bicubic interpolation, and gated encoder skip paths
+limit direct noise transfer into the decoder.
 
 Config (lightweight, per spec): dim=32, depths=[1,2,2,4], heads=[1,2,4,8].
 """
@@ -32,6 +30,47 @@ class LayerNorm2d(nn.Module):
         return x * self.weight.view(1, -1, 1, 1)
 
 
+class EdgeGuidedAttention(nn.Module):
+    """Edge-guided attention uses an explicit Sobel edge map to gate spatial features."""
+
+    def __init__(self, channels, bias=False):
+        super().__init__()
+        self.register_buffer("sobel_x", torch.tensor([[-1.0, 0.0, 1.0],
+                                                       [-2.0, 0.0, 2.0],
+                                                       [-1.0, 0.0, 1.0]], dtype=torch.float32).view(1, 1, 3, 3))
+        self.register_buffer("sobel_y", torch.tensor([[-1.0, -2.0, -1.0],
+                                                       [0.0, 0.0, 0.0],
+                                                       [1.0, 2.0, 1.0]], dtype=torch.float32).view(1, 1, 3, 3))
+        self.attn_conv = nn.Conv2d(channels * 2, channels, kernel_size=1, bias=bias)
+
+    def forward(self, x, feat):
+        sx = F.conv2d(x, self.sobel_x.to(x.device), padding=1)
+        sy = F.conv2d(x, self.sobel_y.to(x.device), padding=1)
+        edge_map = torch.sqrt(sx * sx + sy * sy + 1e-6)
+        combined = torch.cat([feat, edge_map.repeat(1, feat.shape[1], 1, 1)], dim=1)
+        return feat * torch.sigmoid(self.attn_conv(combined))
+
+
+class FFTBranch(nn.Module):
+    """Frequency branch preserves periodic wafer patterns via a lightweight FFT stream."""
+
+    def __init__(self, in_channels, out_channels, bias=False):
+        super().__init__()
+        self.project = nn.Sequential(
+            nn.Conv2d(in_channels * 2, out_channels, kernel_size=3, padding=1, bias=bias),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=bias),
+        )
+
+    def forward(self, x):
+        fft = torch.fft.rfft2(x, norm="ortho")
+        mag = torch.log1p(torch.abs(fft))
+        phase = torch.angle(fft)
+        freq_feat = torch.cat([mag, phase], dim=1)
+        freq_feat = self.project(freq_feat)
+        return F.interpolate(freq_feat, size=x.shape[-2:], mode="bilinear", align_corners=False)
+
+
 class MDTA(nn.Module):
     """Multi-Dconv Head Transposed Attention.
 
@@ -49,24 +88,37 @@ class MDTA(nn.Module):
         self.qkv_dwconv = nn.Conv2d(dim * 3, dim * 3, kernel_size=3, stride=1,
                                      padding=1, groups=dim * 3, bias=bias)
         self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+        self.spatial_conv = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=1, bias=bias),
+            nn.GELU(),
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=bias),
+            nn.Sigmoid(),
+        )
 
     def forward(self, x):
         b, c, h, w = x.shape
+        residual = x
         qkv = self.qkv_dwconv(self.qkv(x))
         q, k, v = qkv.chunk(3, dim=1)
 
-        q = q.reshape(b, self.num_heads, c // self.num_heads, h * w)
-        k = k.reshape(b, self.num_heads, c // self.num_heads, h * w)
-        v = v.reshape(b, self.num_heads, c // self.num_heads, h * w)
+        q = q.reshape(b, self.num_heads, c // self.num_heads, h * w).transpose(-2, -1)
+        k = k.reshape(b, self.num_heads, c // self.num_heads, h * w).transpose(-2, -1)
+        v = v.reshape(b, self.num_heads, c // self.num_heads, h * w).transpose(-2, -1)
 
         q = F.normalize(q, dim=-1)
         k = F.normalize(k, dim=-1)
+        q = q * self.temperature.view(1, self.num_heads, 1, 1)
 
-        attn = (q @ k.transpose(-2, -1)) * self.temperature
-        attn = attn.softmax(dim=-1)
+        if hasattr(F, "scaled_dot_product_attention"):
+            out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        else:
+            attn = (q @ k.transpose(-2, -1))
+            attn = attn.softmax(dim=-1)
+            out = attn @ v
 
-        out = (attn @ v).reshape(b, c, h, w)
-        return self.project_out(out)
+        out = out.transpose(-2, -1).reshape(b, c, h, w)
+        spatial = residual * self.spatial_conv(residual)
+        return self.project_out(out + spatial)
 
 
 class GDFN(nn.Module):
@@ -92,12 +144,17 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.norm1 = LayerNorm2d(dim)
         self.attn = MDTA(dim, num_heads, bias)
+        self.edge_attn = EdgeGuidedAttention(dim, bias)
         self.norm2 = LayerNorm2d(dim)
         self.ffn = GDFN(dim, ffn_expansion_factor, bias)
+        self.layer_scale_1 = nn.Parameter(torch.ones(dim) * 1e-6)
+        self.layer_scale_2 = nn.Parameter(torch.ones(dim) * 1e-6)
 
     def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.ffn(self.norm2(x))
+        attn_out = self.attn(self.norm1(x))
+        attn_out = self.edge_attn(x, attn_out)
+        x = x + attn_out * self.layer_scale_1.view(1, -1, 1, 1)
+        x = x + self.ffn(self.norm2(x)) * self.layer_scale_2.view(1, -1, 1, 1)
         return x
 
 
@@ -139,7 +196,12 @@ class LightweightRestormer(nn.Module):
         super().__init__()
         self.scale = scale  # LR->HR upsample factor; MUST match dataset's downsample factor
 
+        self.pre_upsample = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels * scale * scale, 3, 1, 1, bias=bias),
+            nn.PixelShuffle(scale),
+        )
         self.patch_embed = nn.Conv2d(in_channels, dim, 3, 1, 1, bias=bias)
+        self.fft_branch = FFTBranch(in_channels, dim, bias=bias)
 
         # ---- Encoder (3 levels) ----
         self.enc1 = nn.Sequential(*[TransformerBlock(dim, heads[0], ffn_expansion_factor, bias)
@@ -163,16 +225,19 @@ class LightweightRestormer(nn.Module):
         self.reduce3 = nn.Conv2d(dim * 8, dim * 4, 1, bias=bias)        # concat(dim*4, dim*4) -> dim*4
         self.dec3 = nn.Sequential(*[TransformerBlock(dim * 4, heads[2], ffn_expansion_factor, bias)
                                      for _ in range(depths[2])])
+        self.skip_gate3 = nn.Parameter(torch.ones(1))
 
         self.up2 = Upsample(dim * 4)                                    # -> dim*2, H/2
         self.reduce2 = nn.Conv2d(dim * 4, dim * 2, 1, bias=bias)
         self.dec2 = nn.Sequential(*[TransformerBlock(dim * 2, heads[1], ffn_expansion_factor, bias)
                                      for _ in range(depths[1])])
+        self.skip_gate2 = nn.Parameter(torch.ones(1))
 
         self.up1 = Upsample(dim * 2)                                    # -> dim, H
         self.reduce1 = nn.Conv2d(dim * 2, dim, 1, bias=bias)
         self.dec1 = nn.Sequential(*[TransformerBlock(dim, heads[0], ffn_expansion_factor, bias)
                                      for _ in range(depths[0])])
+        self.skip_gate1 = nn.Parameter(torch.ones(1))
 
         # light refinement stage before the output head
         self.refine = nn.Sequential(*[TransformerBlock(dim, heads[0], ffn_expansion_factor, bias)
@@ -193,13 +258,14 @@ class LightweightRestormer(nn.Module):
         return x
 
     def forward(self, lr):
-        # Bicubic baseline: handles the resolution-loss degradation; LR may contain
-        # values outside [0,1] here and that's fine — interpolation doesn't clip.
-        base = F.interpolate(lr, scale_factor=self.scale, mode="bicubic", align_corners=False)
+        # Learnable sub-pixel upsampling replaces a fixed bicubic baseline.
+        # This lets the model learn better edge reconstruction for wafer features.
+        base = self.pre_upsample(lr)
         h0, w0 = base.shape[-2:]
         base_padded = self._pad_to_multiple(base, multiple=8)
 
-        x = self.patch_embed(base_padded)
+        fft_feat = self.fft_branch(base_padded)
+        x = self.patch_embed(base_padded) + fft_feat
 
         e1 = self.enc1(x)
         x = self.down1(e1)
@@ -211,22 +277,22 @@ class LightweightRestormer(nn.Module):
         x = self.bottleneck(x)
 
         x = self.up3(x)
-        x = self.reduce3(torch.cat([x, e3], dim=1))
+        x = self.reduce3(torch.cat([x, e3 * self.skip_gate3], dim=1))
         x = self.dec3(x)
 
         x = self.up2(x)
-        x = self.reduce2(torch.cat([x, e2], dim=1))
+        x = self.reduce2(torch.cat([x, e2 * self.skip_gate2], dim=1))
         x = self.dec2(x)
 
         x = self.up1(x)
-        x = self.reduce1(torch.cat([x, e1], dim=1))
+        x = self.reduce1(torch.cat([x, e1 * self.skip_gate1], dim=1))
         x = self.dec1(x)
 
         x = self.refine(x)
         out = self.output_conv(x)
 
         out = out[..., :h0, :w0]   # drop the reflect-padding
-        out = out + base           # residual correction over the bicubic baseline
+        out = out + base           # residual correction over the learned baseline
 
         # GT is normalized to [0, 1] — clamp the final restored output to match
         return torch.clamp(out, 0.0, 1.0)

@@ -20,6 +20,8 @@ import os
 import glob
 import time
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 
 import numpy as np
 import cv2
@@ -38,7 +40,25 @@ def parse_args():
     p.add_argument("--scale", type=int, default=4)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--no_compile", action="store_true", help="disable torch.compile")
+    p.add_argument("--export_onnx", action="store_true",
+                   help="export the restored model to ONNX for FP16 inference backends")
+    p.add_argument("--onnx_path", default="restormer.onnx",
+                   help="path to write ONNX model when --export_onnx is enabled")
     return p.parse_args()
+
+
+def export_onnx_model(model, input_shape, path, device):
+    model.eval()
+    dummy = torch.randn(input_shape, device=device)
+    torch.onnx.export(
+        model, dummy, path,
+        opset_version=17,
+        input_names=["input"], output_names=["output"],
+        dynamic_axes={"input": {0: "batch", 2: "height", 3: "width"},
+                      "output": {0: "batch", 2: "height", 3: "width"}},
+        do_constant_folding=True,
+    )
+    print(f"Exported ONNX model to {path}")
 
 
 def build_model(weights_path, scale, device, use_compile):
@@ -72,38 +92,64 @@ def main():
     files = sorted(f for f in glob.glob(os.path.join(args.input_dir, "*")) if f.lower().endswith(exts))
     print(f"Found {len(files)} images to restore.")
 
-    batch, names = [], []
+    use_bfloat16 = (device.type == "cuda" and
+                    getattr(torch.cuda, "is_bf16_supported", lambda: False)())
+    autocast_dtype = torch.bfloat16 if use_bfloat16 else torch.float16
+
+    loader_executor = ThreadPoolExecutor(max_workers=4)
+    writer_executor = ThreadPoolExecutor(max_workers=4)
+    pending = deque()
+    save_futures = []
     n_done, total_time = 0, 0.0
 
-    def flush():
+    def flush(batch, names):
         nonlocal n_done, total_time
         if not batch:
             return
         t0 = time.time()
         x = torch.stack(batch).to(device, non_blocking=True).to(memory_format=torch.channels_last)
-        with torch.no_grad(), autocast(enabled=device.type == "cuda"):
+        with torch.inference_mode(), autocast(dtype=autocast_dtype, enabled=device.type == "cuda"):
             out = model(x)
         out = out.float().clamp(0.0, 1.0).cpu().numpy()
         if device.type == "cuda":
-            torch.cuda.synchronize()  # ensure GPU work is actually finished before timing stops
+            torch.cuda.synchronize()
         total_time += time.time() - t0
 
         for j, name in enumerate(names):
             restored = (out[j, 0] * 255.0).round().astype(np.uint8)
             out_path = os.path.join(args.output_dir, os.path.splitext(name)[0] + ".png")
-            cv2.imwrite(out_path, restored)
+            save_futures.append(writer_executor.submit(cv2.imwrite, out_path, restored))
         n_done += len(names)
-        batch.clear()
-        names.clear()
 
+    if args.export_onnx:
+        export_onnx_model(model, (1, 1, 128, 128), args.onnx_path, device)
+
+    batch, names = [], []
     for fpath in files:
-        arr = load_array(fpath)  # unclipped float32, identical preprocessing to training
-        tensor = torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0).float()
-        batch.append(tensor)
-        names.append(os.path.basename(fpath))
+        pending.append((os.path.basename(fpath), loader_executor.submit(load_array, fpath)))
+        if len(pending) >= args.batch_size * 2:
+            while pending and len(batch) < args.batch_size:
+                name, future = pending.popleft()
+                arr = future.result()
+                batch.append(torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0).float())
+                names.append(name)
+            flush(batch, names)
+            batch, names = [], []
+
+    while pending:
+        name, future = pending.popleft()
+        arr = future.result()
+        batch.append(torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0).float())
+        names.append(name)
         if len(batch) == args.batch_size:
-            flush()
-    flush()  # remaining partial batch
+            flush(batch, names)
+            batch, names = [], []
+    flush(batch, names)
+
+    loader_executor.shutdown(wait=True)
+    writer_executor.shutdown(wait=True)
+    for fut in save_futures:
+        fut.result()
 
     fps = n_done / total_time if total_time > 0 else 0.0
     print(f"Restored {n_done} images in {total_time:.2f}s -> {fps:.2f} FPS")

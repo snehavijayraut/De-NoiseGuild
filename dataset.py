@@ -16,6 +16,8 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import albumentations as A
 
+from dataset_generator import apply_kla_sem_degradation
+
 
 def load_array(path: str) -> np.ndarray:
     """
@@ -49,6 +51,8 @@ def load_array(path: str) -> np.ndarray:
     return arr  # <-- no np.clip() here, intentionally
 
 
+
+
 class RestorationDataset(Dataset):
     """
     Pairs LR/HR files by matching filename stem. Applies:
@@ -58,30 +62,36 @@ class RestorationDataset(Dataset):
          ReplayCompose — this lets us reuse the exact same transform
          parameters across two images of *different* resolution (LR is
          `scale`x smaller than HR), which a normal Compose can't do safely.
+      3. Optional KLA-style synthetic degradation on the fly for OOD robustness.
     """
 
     def __init__(self, lr_dir, hr_dir, patch_size=128, scale=4, augment=True,
-                 exts=(".png", ".npy", ".tif", ".tiff")):
+                 synthetic_degradation=False, exts=(".png", ".npy", ".tif", ".tiff")):
         self.lr_dir = lr_dir
         self.hr_dir = hr_dir
         self.patch_size = patch_size          # HR patch size in pixels
         self.scale = scale                     # must match your degradation's downsample factor
         self.augment = augment
+        self.synthetic_degradation = synthetic_degradation
         assert patch_size % 8 == 0, "patch_size must be a multiple of 8 (3 U-Net downsample stages)"
 
         hr_files = sorted(f for f in os.listdir(hr_dir) if f.lower().endswith(exts))
         self.pairs = []
-        for f in hr_files:
-            stem = os.path.splitext(f)[0]
-            lr_path = next(
-                (os.path.join(lr_dir, stem + e) for e in exts
-                 if os.path.exists(os.path.join(lr_dir, stem + e))),
-                None,
-            )
-            if lr_path:
-                self.pairs.append((lr_path, os.path.join(hr_dir, f)))
-        if not self.pairs:
-            raise RuntimeError(f"No matching LR/HR pairs found between {lr_dir} and {hr_dir}")
+        if synthetic_degradation:
+            for f in hr_files:
+                self.pairs.append((None, os.path.join(hr_dir, f)))
+        else:
+            for f in hr_files:
+                stem = os.path.splitext(f)[0]
+                lr_path = next(
+                    (os.path.join(lr_dir, stem + e) for e in exts
+                     if os.path.exists(os.path.join(lr_dir, stem + e))),
+                    None,
+                )
+                if lr_path:
+                    self.pairs.append((lr_path, os.path.join(hr_dir, f)))
+            if not self.pairs:
+                raise RuntimeError(f"No matching LR/HR pairs found between {lr_dir} and {hr_dir}")
 
         # Geometry-only ops: safe to apply to unbounded LR values because they
         # never touch pixel *magnitudes*, only spatial layout.
@@ -111,16 +121,29 @@ class RestorationDataset(Dataset):
                        left * self.scale: left * self.scale + self.patch_size]
         return lr_patch, hr_patch
 
+    def _apply_synthetic_noise(self, lr: np.ndarray) -> np.ndarray:
+        # Controlled dynamic speckle and Gaussian augmentation for small SEM/wafer datasets.
+        if np.random.rand() < 0.75:
+            speckle_std = np.random.uniform(0.02, 0.08)
+            lr = lr * (1.0 + np.random.normal(loc=0.0, scale=speckle_std, size=lr.shape).astype(np.float32))
+        if np.random.rand() < 0.75:
+            gauss_std = np.random.uniform(0.005, 0.03)
+            lr = lr + np.random.normal(loc=0.0, scale=gauss_std, size=lr.shape).astype(np.float32)
+        return lr
+
     def __getitem__(self, idx):
         lr_path, hr_path = self.pairs[idx]
-        lr = load_array(lr_path)
         hr = load_array(hr_path)
+        lr = (apply_kla_sem_degradation(hr, scale=self.scale)
+              if lr_path is None else load_array(lr_path))
 
         if self.augment:
             lr, hr = self._paired_random_crop(lr, hr)
             replayed = self.geo_transform(image=hr)
             hr = replayed["image"]
             lr = A.ReplayCompose.replay(replayed["replay"], image=lr)["image"]
+            if not self.synthetic_degradation:
+                lr = self._apply_synthetic_noise(lr)
 
         lr_t = torch.from_numpy(np.ascontiguousarray(lr)).unsqueeze(0).float()
         hr_t = torch.from_numpy(np.ascontiguousarray(hr)).unsqueeze(0).float()
@@ -128,8 +151,9 @@ class RestorationDataset(Dataset):
 
 
 def build_dataloaders(train_lr, train_hr, val_lr, val_hr, patch_size=128, scale=4,
-                       batch_size=16, num_workers=8):
-    train_ds = RestorationDataset(train_lr, train_hr, patch_size, scale, augment=True)
+                       batch_size=16, num_workers=8, synthetic_degradation=False):
+    train_ds = RestorationDataset(train_lr, train_hr, patch_size, scale,
+                                  augment=True, synthetic_degradation=synthetic_degradation)
     val_ds = RestorationDataset(val_lr, val_hr, patch_size, scale, augment=False)
 
     train_loader = DataLoader(
