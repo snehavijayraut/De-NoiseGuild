@@ -10,12 +10,13 @@ GPUs.
 
 ```
 ├── dataset.py       # SEMDataset: paired / synthetic LR-HR loading + augmentation
-├── infer.py         # 8-fold TTA inference -> predictions/ + submission.zip
-├── losses.py        # CharbonnierLoss, FFTLoss, SobelGradientLoss, KLAPhysicsLoss
-├── model.py          # NAFNetSR architecture (NAFBlock / SimpleGate based)
-├── README.md         # This file
-├── requirements.txt  # Python dependencies
-└── train.py          # Training driver (baseline + finetune modes)
+├── dataset_generator.py  # optional SEM degradation / LR synthesis helper
+├── infer.py              # 8-fold TTA inference -> predictions/ + submission.zip
+├── losses.py             # CharbonnierLoss, FFTLoss, SobelGradientLoss, KLAPhysicsLoss
+├── model.py              # NAFNetSR architecture (NAFBlock / SimpleGate based)
+├── README.md             # This file
+├── requirements.txt      # Python dependencies
+└── train.py              # Training driver (baseline + finetune modes)
 ```
 
 ## Architecture Summary
@@ -125,7 +126,9 @@ python infer.py \
 Runs 4 rotations x 2 horizontal-flip states (8 total forward passes),
 exactly inverse-transforms each prediction, and averages them in mixed
 precision. Outputs are clipped to `[0.0, 1.0]`, written as
-`<name>_pred.npy` under `--output_dir`, and zipped to `--zip_path`.
+`<name>_pred.npy` under `--output_dir`, and zipped to `--zip_path`. The
+project also provides the trained EMA checkpoint file `best_ema_weights.pth`,
+which is the default model file used for inference.
 
 ## Key CLI Flags (`train.py`)
 
