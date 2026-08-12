@@ -1,5 +1,4 @@
-torch>=2.1
-numpy
-opencv-python
-albumentations
-pytorch-msssim
+torch>=2.1.0
+torchvision>=0.16.0
+numpy>=1.24.0
+scipy>=1.10.0

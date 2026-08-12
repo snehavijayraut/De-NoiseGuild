@@ -1,158 +1,119 @@
 """
-infer.py — Standalone submission inference script.
+infer.py
+Standalone inference script for NAFNetSR.
 
-    python infer.py --input_dir <LR_dir> --output_dir <restored_dir> --weights best_weights_only.pth
+Runs 8-fold test-time augmentation (4x 90-degree rotations x 2 horizontal
+flip states), inverse-transforms each prediction back to the canonical
+orientation, and averages them in mixed precision. Predictions are clipped
+to [0.0, 1.0], written as `<name>_pred.npy` to --output_dir, and zipped
+into a single submission archive.
 
-Throughput optimizations (in order of impact):
-  1. Batched inference instead of one-image-at-a-time — amortizes kernel
-     launch overhead across many images per forward pass.
-  2. torch.no_grad() — skips autograd graph construction entirely.
-  3. AMP autocast — fp16 compute on Tensor Cores.
-  4. channels_last memory format — better conv throughput on modern GPUs.
-  5. torch.compile(mode="max-autotune") — fuses the forward pass into fewer,
-     faster kernels; falls back gracefully if unavailable/unsupported.
-  6. cudnn.benchmark = True — autotunes conv algorithms for the fixed
-     inference batch shape.
-The reported FPS covers disk read -> tensor prep -> GPU inference -> disk
-write, matching the benchmark's definition of end-to-end throughput.
+Example (Colab T4):
+  python infer.py --checkpoint /content/checkpoints/best_ema_weights.pth \
+      --input_dir /content/data/test_lr
 """
-import os
-import glob
-import time
+
 import argparse
-from concurrent.futures import ThreadPoolExecutor
-from collections import deque
+import os
+import zipfile
 
 import numpy as np
-import cv2
 import torch
-from torch.cuda.amp import autocast
 
-from model import LightweightRestormer
-from dataset import load_array  # same no-clip loader used during training
+from model import NAFNetSR
 
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--input_dir", required=True)
-    p.add_argument("--output_dir", required=True)
-    p.add_argument("--weights", required=True, help="path to a weights-only .pth file")
-    p.add_argument("--scale", type=int, default=4)
-    p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--no_compile", action="store_true", help="disable torch.compile")
-    p.add_argument("--export_onnx", action="store_true",
-                   help="export the restored model to ONNX for FP16 inference backends")
-    p.add_argument("--onnx_path", default="restormer.onnx",
-                   help="path to write ONNX model when --export_onnx is enabled")
-    return p.parse_args()
+def get_amp_dtype(device):
+    if device.type != "cuda":
+        return torch.float32
+    major, minor = torch.cuda.get_device_capability(device)
+    cc = major + minor / 10.0
+    return torch.bfloat16 if cc >= 8.0 else torch.float16
 
 
-def export_onnx_model(model, input_shape, path, device):
-    model.eval()
-    dummy = torch.randn(input_shape, device=device)
-    torch.onnx.export(
-        model, dummy, path,
-        opset_version=17,
-        input_names=["input"], output_names=["output"],
-        dynamic_axes={"input": {0: "batch", 2: "height", 3: "width"},
-                      "output": {0: "batch", 2: "height", 3: "width"}},
-        do_constant_folding=True,
-    )
-    print(f"Exported ONNX model to {path}")
+def _load_npy_as_float01(path):
+    arr = np.load(path).astype(np.float32)
+    if arr.max() > 1.0 + 1e-6:
+        arr = arr / 255.0
+    arr = np.clip(arr, 0.0, 1.0)
+    if arr.ndim == 3:
+        arr = arr[..., 0] if arr.shape[-1] in (1, 3, 4) else arr[0]
+    return arr
 
 
-def build_model(weights_path, scale, device, use_compile):
-    model = LightweightRestormer(
-        in_channels=1, out_channels=1, dim=32,
-        depths=(1, 2, 2, 4), heads=(1, 2, 4, 8), scale=scale,
-    )
-    state = torch.load(weights_path, map_location=device)
-    state = state.get("model", state)  # accept either a full checkpoint or a weights-only file
-    model.load_state_dict(state)
-    model.to(device).eval()
-    model = model.to(memory_format=torch.channels_last)  # faster conv layout on Tensor Cores
+def _tta_forward(model, x, device, amp_dtype):
+    """8-fold TTA: {identity, rot90, rot180, rot270} x {no-flip, hflip}.
+    Every forward pass is inverse-transformed back to the canonical
+    orientation before averaging, with the inverse flip undone before the
+    inverse rotation (exact reverse of the forward transform order)."""
+    preds = []
+    with torch.no_grad():
+        for k in range(4):  # rotations: 0, 90, 180, 270 degrees
+            for flip in (False, True):
+                xt = torch.rot90(x, k, dims=[-2, -1])
+                if flip:
+                    xt = torch.flip(xt, dims=[-1])
 
-    if use_compile and hasattr(torch, "compile") and device.type == "cuda":
-        try:
-            model = torch.compile(model, mode="max-autotune")
-        except Exception as e:  # compile isn't supported on every platform/driver combo
-            print(f"torch.compile unavailable, falling back to eager mode: {e}")
-    return model
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=(device.type == "cuda")):
+                    yt = model(xt)
+                yt = yt.float()
+
+                # exact inverse transform (reverse order: undo flip, then rotation)
+                if flip:
+                    yt = torch.flip(yt, dims=[-1])
+                if k:
+                    yt = torch.rot90(yt, -k, dims=[-2, -1])
+
+                preds.append(yt)
+    return torch.stack(preds, dim=0).mean(dim=0)
 
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="NAFNetSR 8-fold TTA inference")
+    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--input_dir", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, default="/content/predictions")
+    parser.add_argument("--zip_path", type=str, default="/content/submission.zip")
+    parser.add_argument("--scale", type=int, default=2)
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.backends.cudnn.benchmark = True
+    amp_dtype = get_amp_dtype(device)
+    print(f"[setup] device={device} amp_dtype={amp_dtype}")
 
     os.makedirs(args.output_dir, exist_ok=True)
-    model = build_model(args.weights, args.scale, device, use_compile=not args.no_compile)
 
-    exts = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".npy")
-    files = sorted(f for f in glob.glob(os.path.join(args.input_dir, "*")) if f.lower().endswith(exts))
-    print(f"Found {len(files)} images to restore.")
+    model = NAFNetSR(scale=args.scale).to(device)
+    ckpt = torch.load(args.checkpoint, map_location=device)
+    state = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
+    model.load_state_dict(state)
+    model.eval()
 
-    use_bfloat16 = (device.type == "cuda" and
-                    getattr(torch.cuda, "is_bf16_supported", lambda: False)())
-    autocast_dtype = torch.bfloat16 if use_bfloat16 else torch.float16
+    input_files = sorted(f for f in os.listdir(args.input_dir) if f.lower().endswith(".npy"))
+    if not input_files:
+        raise FileNotFoundError(f"No .npy files found in input_dir={args.input_dir}")
 
-    loader_executor = ThreadPoolExecutor(max_workers=4)
-    writer_executor = ThreadPoolExecutor(max_workers=4)
-    pending = deque()
-    save_futures = []
-    n_done, total_time = 0, 0.0
+    out_paths = []
+    for fname in input_files:
+        arr = _load_npy_as_float01(os.path.join(args.input_dir, fname))
+        x = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).float().to(device)
 
-    def flush(batch, names):
-        nonlocal n_done, total_time
-        if not batch:
-            return
-        t0 = time.time()
-        x = torch.stack(batch).to(device, non_blocking=True).to(memory_format=torch.channels_last)
-        with torch.inference_mode(), autocast(dtype=autocast_dtype, enabled=device.type == "cuda"):
-            out = model(x)
-        out = out.float().clamp(0.0, 1.0).cpu().numpy()
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        total_time += time.time() - t0
+        pred = _tta_forward(model, x, device, amp_dtype)
+        pred = pred.clamp(0.0, 1.0).squeeze(0).squeeze(0).cpu().numpy().astype(np.float32)
 
-        for j, name in enumerate(names):
-            restored = (out[j, 0] * 255.0).round().astype(np.uint8)
-            out_path = os.path.join(args.output_dir, os.path.splitext(name)[0] + ".png")
-            save_futures.append(writer_executor.submit(cv2.imwrite, out_path, restored))
-        n_done += len(names)
+        stem = os.path.splitext(fname)[0]
+        out_name = f"{stem}_pred.npy"
+        out_path = os.path.join(args.output_dir, out_name)
+        np.save(out_path, pred)
+        out_paths.append(out_path)
+        print(f"[infer] {fname} -> {out_name}  shape={pred.shape}")
 
-    if args.export_onnx:
-        export_onnx_model(model, (1, 1, 128, 128), args.onnx_path, device)
+    with zipfile.ZipFile(args.zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in out_paths:
+            zf.write(p, arcname=os.path.basename(p))
 
-    batch, names = [], []
-    for fpath in files:
-        pending.append((os.path.basename(fpath), loader_executor.submit(load_array, fpath)))
-        if len(pending) >= args.batch_size * 2:
-            while pending and len(batch) < args.batch_size:
-                name, future = pending.popleft()
-                arr = future.result()
-                batch.append(torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0).float())
-                names.append(name)
-            flush(batch, names)
-            batch, names = [], []
-
-    while pending:
-        name, future = pending.popleft()
-        arr = future.result()
-        batch.append(torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0).float())
-        names.append(name)
-        if len(batch) == args.batch_size:
-            flush(batch, names)
-            batch, names = [], []
-    flush(batch, names)
-
-    loader_executor.shutdown(wait=True)
-    writer_executor.shutdown(wait=True)
-    for fut in save_futures:
-        fut.result()
-
-    fps = n_done / total_time if total_time > 0 else 0.0
-    print(f"Restored {n_done} images in {total_time:.2f}s -> {fps:.2f} FPS")
+    print(f"[done] wrote {len(out_paths)} predictions to {args.output_dir}")
+    print(f"[done] compressed submission -> {args.zip_path}")
 
 
 if __name__ == "__main__":
