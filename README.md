@@ -101,7 +101,7 @@ python train.py \
   --hr_dir /content/data/train_hr \
   --val_hr_dir /content/data/val_hr \
   --patch_size 128 \
-  --batch_size 16 \
+  --batch_size 8 \
   --epochs 50 \
   --lr 2e-4 \
   --checkpoint_dir /content/checkpoints
