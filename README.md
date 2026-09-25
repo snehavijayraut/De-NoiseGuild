@@ -1,123 +1,117 @@
-# 🔬 De-Noise Guild — AI-Based SEM Image Restoration & 2× Super-Resolution
+# 🔬 De-Noise Guild — SEM Image Cleanup & 2× Upscaling
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
-[![Hardware](https://img.shields.io/badge/Hardware-NVIDIA%20GPU%20%7C%20CUDA%20%7C%20CPU-success.svg)]()
 [![Competition](https://img.shields.io/badge/SEMICON-Hackathon%202026-orange.svg)]()
 
-> **Non-linear activation-free deep learning architecture for single-channel SEM denoising and 2× super-resolution.**
+## 📌 What This Project Does
 
-**De-Noise Guild** is an end-to-end deep learning restoration pipeline developed for the **KLA Problem Statement: AI-Based Restoration of Degraded Images** at the SEMICON India Hackathon 2026.
+This project cleans up noisy SEM (Scanning Electron Microscope) images and makes them **2× bigger and sharper**, using a deep learning model.
 
-The pipeline performs joint **denoising** (suppression of high-frequency speckle noise and Gaussian sensor noise) and **2× super-resolution** on single-channel `.npy` matrix arrays. It utilizes **NAFNetSR**—a Non-Linear Activation-Free architecture paired with an 8-fold test-time augmentation (TTA) ensemble—to reconstruct critical line/space feature geometries in Scanning Electron Microscope (SEM) metrology imagery.
+Think of it like this:
+- **Input:** a small, grainy, noisy image
+- **Output:** a bigger, cleaner, sharper version of the same image
 
----
-
-## 👥 Team Information
-
-* **Team Name:** De-Noise Guild
-* **College:** AISSMS College of Engineering, Pune (SPPU)
-* **Team Members:**
-  * **Sneha Vijay Raut** — Team Leader
-  * **Sairaj Bandu Potgantwar** — Member
-  * **Sairaj Harish Kalushe** — Member
+It was built for the **KLA Problem Statement** at the **SEMICON India Hackathon 2026**.
 
 ---
 
-## ⚡ Submission Quick Start (Official Interface)
+## 👤 Author
 
-This solution is fully self-contained, validated offline, and executes without network calls, external downloads, API tokens, or manual intervention.
+**Sneha Vijay Raut**
+AISSMS College of Engineering, Pune (SPPU)
 
-### 1. Environment Setup
+---
+
+## 🚀 How to Run It
+
+### Step 1 — Install requirements
 ```bash
-python -m pip install -r requirements.txt
+pip install -r requirements.txt
 ```
 
-### 2. Model Checkpoint Location
-Ensure model weights are located in the `models/` directory:
+### Step 2 — Check the model file is here
 ```text
 models/best_ema_weights.pth
 ```
 
-### 3. Execute Inference
-Run the standard entrypoint using positional arguments:
+### Step 3 — Run the program
 ```bash
-python run.py <input-dir> <output-dir>
+python run.py <input-folder> <output-folder>
 ```
 
----
+**Example:**
+```bash
+python run.py ./test_images ./results
+```
 
-## 📋 Evaluation Compliance Checklist
-
-- [x] **Execution Signature:** Entrypoint is strictly named `run.py` and accepts positional CLI arguments `python run.py <input-dir> <output-dir>`.
-- [x] **Batch Loading:** Automatically discovers and parses all single-channel `.npy` arrays from `<input-dir>`.
-- [x] **Automatic Directory Creation:** Automatically initializes `<output-dir>` if it does not already exist.
-- [x] **Exact 1:1 Mapping:** Produces exactly one restored array per input file using the **identical base filename** without extra suffixes or stems.
-- [x] **Array Dimensions:** Output tensors are formatted as 2D grayscale float32 arrays with shape `(H, W)`.
-- [x] **Target Resolution:** Accurately scales images to 2× spatial resolution ($H_{\text{out}} = 2 \times H_{\text{in}}$, $W_{\text{out}} = 2 \times W_{\text{in}}$) with dynamic fallback.
-- [x] **Value Normalization & Sanitization:** Output floats are strictly bounded to $[0.0, 1.0]$ and sanitized using `nan_to_num` to ensure zero `NaN` or `Inf` values.
-- [x] **Fully Offline & Self-Contained:** Executes on local GPU without network dependencies, API keys, or external downloads.
+That's it. It reads every image from the input folder and saves the cleaned-up, bigger version in the output folder.
 
 ---
 
-## 🏗️ Repository Layout
+## 🧠 How It Works (Simple Version)
+
+1. **Input:** Grainy, low-resolution grayscale images (`.npy` files)
+2. **Model:** A neural network called **NAFNetSR** looks at the image and learns to remove noise while adding detail
+3. **Output:** A clean image that is **twice as tall and twice as wide** as the input
+4. **Extra trick:** The model looks at the image 8 different ways (rotated/flipped) and averages the results — this makes the output more accurate and stable
+
+---
+
+## 📋 What the Output Looks Like
+
+- Same filename as the input
+- 2× the height and width of the input
+- Pixel values kept between `0.0` and `1.0`
+- No broken/invalid values (`NaN` or `Inf` are automatically fixed)
+
+---
+
+## 🏗️ Project Files
 
 ```text
 De-NoiseGuild/
 ├── models/
-│   └── best_ema_weights.pth   # 50-epoch optimized EMA shadow weights
-├── dataset.py                 # Dataset loader with bicubic downsampling & Gaussian noise synthesis
-├── losses.py                  # Charbonnier, Real-FFT, and Sobel gradient loss definitions
-├── model.py                   # NAFNetSR model architecture (SimpleGate + SCA blocks)
-├── README.md                  # Model architecture and execution documentation
-├── requirements.txt           # Explicitly pinned Python dependencies
-├── run.py                     # Official evaluation entrypoint with 8-fold TTA
-└── train.py                   # Model training driver with EMA tracking
+│   └── best_ema_weights.pth   # trained model weights
+├── dataset.py                 # loads images & creates noisy training data
+├── losses.py                  # math used to measure how "wrong" the output is
+├── model.py                   # the NAFNetSR neural network
+├── run.py                     # main script — run this to clean images
+├── train.py                   # script used to train the model
+└── requirements.txt           # list of Python packages needed
 ```
 
 ---
 
-## 🔬 Architecture Specifications (`NAFNetSR`)
+## 🏋️ How It Was Trained (Simple Version)
 
-`NAFNetSR` eliminates compute-heavy nonlinear activations (GELU/ReLU) and self-attention layers in favor of lightweight, element-wise linear blocks:
-
-* **Encoder Hierarchy:** 4 hierarchical stages with block depths `(1, 2, 2, 4)` across channel widths `(32, 64, 128, 256)` using strided convolutions for spatial downsampling.
-* **Activation-Free Core:**
-  * **SimpleGate:** Splits feature channels in half ($C \rightarrow C/2$) and performs element-wise multiplication, introducing non-linearity without activation overhead.
-  * **Simplified Channel Attention (SCA):** Uses global average pooling followed by a $1\times 1$ convolution to model inter-channel dependencies efficiently.
-* **Symmetric Decoder:** Mirrored decoder stages with block depths `(4, 2, 2, 1)` utilizing `ConvTranspose2d` upsampling and additive skip connections.
-* **Sub-Pixel Upsampling:** Reconstruction head features a $3\times 3$ convolution followed by `PixelShuffle(scale=2)` to expand feature maps to target $2\times$ spatial resolution.
-* **Global Residual Shortcut:** A bilinear-interpolated skip path directly routes the low-resolution input to the final reconstructed layer ($I_{\text{out}} = \mathcal{F}(I_{\text{in}}) + \text{Bilinear}(I_{\text{in}}, 2\times)$), eliminating boundary haloing and edge ringing.
-
----
-
-## 🏋️ Training Setup & Optimization
-
-The model was trained for **50 epochs** using **Exponential Moving Average (EMA)** tracking:
+If you want to retrain the model yourself:
 
 ```bash
 python train.py \
-  --mode baseline \
-  --hr_dir /content/data/train_hr \
-  --val_hr_dir /content/data/val_hr \
+  --hr_dir ./data/train_hr \
+  --val_hr_dir ./data/val_hr \
   --patch_size 128 \
   --batch_size 8 \
   --epochs 50 \
   --lr 2e-4 \
-  --checkpoint_dir /content/checkpoints
+  --checkpoint_dir ./checkpoints
 ```
 
-* **Objective Function:** Mean Absolute Error ($\text{L1 Loss} = \frac{1}{N} \sum |I_{\text{pred}} - I_{\text{target}}|$) ensuring sharp, artifact-free baseline reconstruction.
-* **Optimizer:** AdamW ($\beta_1 = 0.9, \beta_2 = 0.999$, weight decay = $10^{-4}$).
-* **Learning Rate Schedule:** Cosine Annealing decay starting at $2 \times 10^{-4}$ down to $\eta_{\text{min}} = 10^{-6}$.
-* **EMA Weight Shadowing:** Tracked shadow weights with a decay factor of $\alpha = 0.999$, saving parameters via `best_ema_weights.pth` for test generalization.
+**In plain terms:**
+- Trained for **50 rounds (epochs)** over the training images
+- Used a smart way of saving the "best average" version of the model weights (called EMA), so results stay stable
+- Learns by comparing its cleaned-up guess to the real, high-quality image and slowly getting closer
 
 ---
 
-## 🚀 Inference & 8-Fold Test-Time Augmentation (TTA)
+## ✅ Quick Summary
 
-The evaluation script `run.py` runs an 8-pass geometric ensemble during test evaluation:
-1. **Geometric Transformations:** Generates 8 transformed variants per input matrix ($4\text{ rotations } [0^\circ, 90^\circ, 180^\circ, 270^\circ] \times 2\text{ horizontal flip states}$).
-2. **Precision Execution:** Automatically selects `torch.bfloat16` for Ampere+ GPUs or `torch.float16` for Turing T4 GPUs during forward passes with the loaded EMA weights.
-3. **Inverse Mapping & Ensemble Mean:** Inverts all geometric rotations/flips in reverse sequence and calculates the arithmetic mean of all 8 passes.
-4. **Sanitization:** Clamps values strictly to $[0.0, 1.0]$ and writes float32 `.npy` arrays to `<output-dir>`.
+| Feature | Details |
+|---|---|
+| Task | Denoise + 2× upscale SEM images |
+| Input format | `.npy` grayscale arrays |
+| Output format | `.npy` grayscale arrays, 2× size |
+| Model | NAFNetSR (lightweight, no heavy attention layers) |
+| Works offline? | ✅ Yes, no internet needed |
+| Hardware | Runs on GPU or CPU |
