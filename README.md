@@ -19,7 +19,7 @@ It was built for the **KLA Problem Statement** at the **SEMICON India Hackathon 
 ## 👤 Author
 
 **Sneha Vijay Raut**
-AISSMS College of Engineering, Pune (SPPU)
+
 
 ---
 
