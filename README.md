@@ -66,22 +66,32 @@ That's it. It reads every image from the input folder and saves the cleaned-up, 
 - No broken/invalid values (`NaN` or `Inf` are automatically fixed)
 
 ---
-
-## 🏗️ Project Files
+## 📁 Project Files
 
 ```text
 De-NoiseGuild/
+│
+├── assets/
+│   ├── sem_sample_03_before_after.png
+│   ├── sem_sample_05_before_after.png
+│   └── sem_sample_08_before_after.png
+│
 ├── models/
-│   └── best_ema_weights.pth   # trained model weights
-├── dataset.py                 # loads images & creates noisy training data
-├── losses.py                  # math used to measure how "wrong" the output is
-├── model.py                   # the NAFNetSR neural network
-├── run.py                     # main script — run this to clean images
-├── train.py                   # script used to train the model
-└── requirements.txt           # list of Python packages needed
-```
-
----
+│   └── best_ema_weights.pth       # trained model weights
+│
+├── dataset.py                     # dataset loading and preprocessing
+├── losses.py                      # pixel, FFT and gradient-based losses
+├── model.py                       # NAFNet-inspired restoration network
+├── run.py                         # inference script for image restoration
+├── train.py                       # model training script
+├── requirements.txt               # required Python packages
+├── .gitignore                     # files excluded from version control
+│
+├── Output_Restoration_Report_10_Samples.pdf
+│                                  # restoration results for 10 samples
+│
+└── Output_Restoration_Report_20_Samples.pdf
+                                   # extended restoration evaluation
 
 ## 🏋️ How It Was Trained (Simple Version)
 
