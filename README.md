@@ -105,6 +105,51 @@ python train.py \
 
 ---
 
+
+## 🖼️ Restoration Results
+
+The model was evaluated on multiple SEM samples. The examples below show the
+transformation from degraded 128 × 128 input images to restored 256 × 256 outputs.
+
+### Sample 1 — Structural Detail Recovery
+
+<p align="center">
+  <img src="assets/sem_sample_03_before_after.png" width="900">
+</p>
+
+**Input:** 128 × 128 degraded SEM image  
+**Output:** 256 × 256 restored image
+
+---
+
+### Sample 2 — Fine Pattern Restoration
+
+<p align="center">
+  <img src="assets/sem_sample_05_before_after.png" width="900">
+</p>
+
+**Input:** 128 × 128 degraded SEM image  
+**Output:** 256 × 256 restored image
+
+---
+
+### Sample 3 — High-Frequency Detail Restoration
+
+<p align="center">
+  <img src="assets/sem_sample_08_before_after.png" width="900">
+</p>
+
+**Input:** 128 × 128 degraded SEM image  
+**Output:** 256 × 256 restored image
+
+---
+
+### 📄 Complete Evaluation Reports
+
+- [10-Sample Restoration Report](./Output_Restoration_Report_10_Samples.pdf)
+- [20-Sample Restoration Report](./Output_Restoration_Report_20_Samples.pdf)
+
+  
 ## ✅ Quick Summary
 
 | Feature | Details |
