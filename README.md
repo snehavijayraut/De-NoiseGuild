@@ -16,12 +16,6 @@ It was built for the **KLA Problem Statement** at the **SEMICON India Hackathon 
 
 ---
 
-## 👤 Author
-
-**Sneha Vijay Raut**
-
-
----
 
 ## 🚀 How to Run It
 
@@ -49,6 +43,52 @@ That's it. It reads every image from the input folder and saves the cleaned-up, 
 
 ---
 
+
+## 🖼️ Restoration Results
+
+The model was evaluated on multiple SEM samples. The examples below show the
+transformation from degraded 128 × 128 input images to restored 256 × 256 outputs.
+
+### Sample 1 — Structural Detail Recovery
+
+<p align="center">
+  <img src="assets/sem_sample_03_before_after.png" width="900">
+</p>
+
+**Input:** 128 × 128 degraded SEM image  
+**Output:** 256 × 256 restored image
+
+---
+
+### Sample 2 — Fine Pattern Restoration
+
+<p align="center">
+  <img src="assets/sem_sample_05_before_after.png" width="900">
+</p>
+
+**Input:** 128 × 128 degraded SEM image  
+**Output:** 256 × 256 restored image
+
+---
+
+### Sample 3 — High-Frequency Detail Restoration
+
+<p align="center">
+  <img src="assets/sem_sample_08_before_after.png" width="900">
+</p>
+
+**Input:** 128 × 128 degraded SEM image  
+**Output:** 256 × 256 restored image
+
+---
+
+### 📄 Complete Evaluation Reports
+
+- [10-Sample Restoration Report](./Output_Restoration_Report_10_Samples.pdf)
+- [20-Sample Restoration Report](./Output_Restoration_Report_20_Samples.pdf)
+
+
+
 ## 🧠 How It Works (Simple Version)
 
 1. **Input:** Grainy, low-resolution grayscale images (`.npy` files)
@@ -58,6 +98,48 @@ That's it. It reads every image from the input folder and saves the cleaned-up, 
 
 ---
 
+## 🔬 Technical Approach
+
+De-Noise Guild uses a NAFNet-inspired encoder-decoder architecture
+designed for grayscale SEM image restoration and 2× super-resolution.
+
+### Model Pipeline
+
+Input SEM Image
+→ Encoder
+→ NAF Blocks
+→ Bottleneck
+→ Decoder + Skip Connections
+→ PixelShuffle ×2
+→ Restored SEM Image
+
+### Key Components
+
+- NAF Blocks
+- SimpleGate
+- Simplified Channel Attention (SCA)
+- Skip Connections
+- PixelShuffle ×2
+
+### Restoration Loss
+
+The model combines:
+
+**Pixel Loss + FFT Loss + Gradient Loss**
+
+This helps preserve overall image quality while improving
+frequency and edge/detail information.
+
+### Inference Enhancement
+
+8-way Test-Time Augmentation (TTA) using rotations and flips,
+followed by averaging the predictions.
+
+### Evaluation
+
+- PSNR
+- SSIM
+  
 ## 📋 What the Output Looks Like
 
 - Same filename as the input
@@ -114,51 +196,6 @@ python train.py \
 - Learns by comparing its cleaned-up guess to the real, high-quality image and slowly getting closer
 
 ---
-
-
-## 🖼️ Restoration Results
-
-The model was evaluated on multiple SEM samples. The examples below show the
-transformation from degraded 128 × 128 input images to restored 256 × 256 outputs.
-
-### Sample 1 — Structural Detail Recovery
-
-<p align="center">
-  <img src="assets/sem_sample_03_before_after.png" width="900">
-</p>
-
-**Input:** 128 × 128 degraded SEM image  
-**Output:** 256 × 256 restored image
-
----
-
-### Sample 2 — Fine Pattern Restoration
-
-<p align="center">
-  <img src="assets/sem_sample_05_before_after.png" width="900">
-</p>
-
-**Input:** 128 × 128 degraded SEM image  
-**Output:** 256 × 256 restored image
-
----
-
-### Sample 3 — High-Frequency Detail Restoration
-
-<p align="center">
-  <img src="assets/sem_sample_08_before_after.png" width="900">
-</p>
-
-**Input:** 128 × 128 degraded SEM image  
-**Output:** 256 × 256 restored image
-
----
-
-### 📄 Complete Evaluation Reports
-
-- [10-Sample Restoration Report](./Output_Restoration_Report_10_Samples.pdf)
-- [20-Sample Restoration Report](./Output_Restoration_Report_20_Samples.pdf)
-
   
 ## ✅ Quick Summary
 
@@ -170,3 +207,9 @@ transformation from degraded 128 × 128 input images to restored 256 × 256 outp
 | Model | NAFNetSR (lightweight, no heavy attention layers) |
 | Works offline? | ✅ Yes, no internet needed |
 | Hardware | Runs on GPU or CPU |
+
+## 👤 Author
+
+**Sneha Vijay Raut**
+
+AI & Machine Learning Engineer
